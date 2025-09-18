@@ -1,2 +1,3 @@
 # NYCU_AIMI
-Assignment for course in NYCU named "Research Project in Application of Artificial Intelligence on Medical Imaging" 
+##Assignment for the course "Research Project on the Application of Artificial Intelligence in Medical Imaging" at NYCU
+ 
