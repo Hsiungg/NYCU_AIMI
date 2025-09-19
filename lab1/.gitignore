@@ -1,0 +1,4 @@
+*.pt
+logs/
+chest_xray/
+runs/
