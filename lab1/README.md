@@ -1,6 +1,6 @@
 # Lab1 - Chest X-ray Classification
 
-## Project Overview
+## Overview
 This project implements **binary chest X-ray image classification** using deep learning models such as **ResNet-18**, **ResNet-50**, and **Swin V2**.  
 The goal is to classify X-ray images as **normal** or **pneumonia**, and evaluate models using **Accuracy**, **Precision**, **Recall**, and **F1-score**.
 
