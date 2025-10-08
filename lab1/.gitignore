@@ -2,3 +2,4 @@
 logs/
 chest_xray/
 runs/
+test_results_*/

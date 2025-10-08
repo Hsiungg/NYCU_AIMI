@@ -84,9 +84,8 @@ def test_model(test_loader, model, device, class_names):
         precision = tp / (tp+fp) if (tp+fp) > 0 else 0
         f1_score = (2*tp) / (2*tp+fp+fn) if (2*tp+fp+fn) > 0 else 0
         
-        # Confusion matrix
-        c_matrix = [[int(tp), int(fn)],
-                    [int(fp), int(tn)]]
+        c_matrix = [[int(tn), int(fp)],
+                    [int(fn), int(tp)]]
 
         # Log results
         logging.info("=== Test Results ===")
@@ -156,8 +155,8 @@ if __name__ == '__main__':
     parser.add_argument('--num_classes', type=int, required=False, default=2, help='Number of classes')
     
     # Test arguments
-    parser.add_argument('--batch_size', type=int, required=False, default=32, help='Batch size for testing')
-    parser.add_argument('--resize', type=int, default=224, help='Image resize dimension')
+    parser.add_argument('--batch_size', type=int, required=False, default=1, help='Batch size for testing')
+    parser.add_argument('--resize', type=int, default=384, help='Image resize dimension')
     parser.add_argument('--save_plots', action='store_true', help='Also display confusion matrix plot (always saves to file)')
 
     args = parser.parse_args()
@@ -173,12 +172,14 @@ if __name__ == '__main__':
     # Load test dataset
     test_transform = transforms.Compose([
         transforms.Resize((args.resize, args.resize)),
-        transforms.ToTensor()
-    ])
-    
+        transforms.CenterCrop(352),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.4823, 0.4823, 0.4823], std=[0.2363, 0.2363, 0.2363])
+        ])
+
     test_dataset = ImageFolder(root=os.path.join(args.dataset, 'test'),
                               transform=test_transform)
-    
+
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
 
     # Log dataset statistics
@@ -195,11 +196,16 @@ if __name__ == '__main__':
         model = models.resnet34(weights=None)
     elif args.model_name == 'resnet50':
         model = models.resnet50(weights=None)
+    elif args.model_name == 'swin_v2':
+        model = models.swin_v2_b(weights=None)
     else:
         raise ValueError(f"Unsupported model: {args.model_name}")
     
     # Modify final layer
-    model.fc = nn.Linear(model.fc.in_features, args.num_classes)
+    if args.model_name == 'swin_v2':
+        model.head = nn.Linear(model.head.in_features, args.num_classes)
+    else:
+        model.fc = nn.Linear(model.fc.in_features, args.num_classes)
     
     # Load trained weights
     if not os.path.exists(args.model_path):
@@ -220,7 +226,7 @@ if __name__ == '__main__':
 
     # Create results directory and save confusion matrix
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    results_dir = f"test_results_{args.model_name}_{timestamp}"
+    results_dir = f"test_results_{args.model_name}"
     os.makedirs(results_dir, exist_ok=True)
     
     # Save confusion matrix
