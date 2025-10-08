@@ -9,8 +9,9 @@ The goal is to classify X-ray images as **normal** or **pneumonia**, and evaluat
 ## Dataset
 The dataset contains chest X-ray images. To download and prepare the dataset:
 
-1. Access the dataset at: `[https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia]`
+1. Access the dataset at: `https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia`
 2. Extract the dataset into the project directory:
+   
 project_root/
 │
 ├── chest_xray/
