@@ -9,14 +9,14 @@ The goal is to classify X-ray images as **normal** or **pneumonia**, and evaluat
 ## Dataset
 The dataset contains chest X-ray images. To download and prepare the dataset:
 
-1. Access the dataset at: `https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia`
+1. Access the dataset at: [Download Dataset](https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia)
 2. Extract the dataset into the project directory:
    
-project_root/
-│
-├── chest_xray/
-│ ├── train.py
-│ └── test.py
+project_root/<br>
+│<br>
+├── chest_xray/<br>
+│ ├── train.py<br>
+│ └── test.py<br>
 
 ## Usage
 
@@ -29,7 +29,7 @@ To train a model, run the following command:
 python train.py --model_name {model_name here. e.g resnet18, resnet50, swin_v2}
 ```
 
-### Training
+### Testing
 To test a model, run the following command:
 
 ```bash
