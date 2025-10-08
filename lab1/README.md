@@ -11,12 +11,14 @@ The dataset contains chest X-ray images. To download and prepare the dataset:
 
 1. Access the dataset at: [Download Dataset](https://www.kaggle.com/datasets/paultimothymooney/chest-xray-pneumonia)
 2. Extract the dataset into the project directory:
-   
-project_root/<br>
-│<br>
-├── chest_xray/<br>
-│ ├── train.py<br>
-│ └── test.py<br>
+
+```
+project_root/
+│
+├── chest_xray/
+│── train.py
+│── test.py
+```
 
 ## Usage
 
@@ -26,13 +28,13 @@ After installing all the dependencies:
 To train a model, run the following command:
 
 ```bash
-python train.py --model_name {model_name here. e.g resnet18, resnet50, swin_v2}
+python train.py --model_name {model_name e.g resnet18, resnet50, swin_v2}
 ```
 
 ### Testing
 To test a model, run the following command:
 
 ```bash
-python test.py --model_name {model_name here. e.g resnet18, resnet50, swin_v2} --model_path {your_path_to_model_weight.pt}
+python test.py --model_name {model_name e.g resnet18, resnet50, swin_v2} --model_path {your_path_to_model_weight.pt}
 
 
