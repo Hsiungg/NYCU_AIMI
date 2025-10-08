@@ -1,4 +1,4 @@
-# Chest X-ray Classification Project
+# Lab1 - Chest X-ray Classification
 
 ## Project Overview
 This project implements **binary chest X-ray image classification** using deep learning models such as **ResNet-18**, **ResNet-50**, and **Swin V2**.  
@@ -36,5 +36,5 @@ To test a model, run the following command:
 
 ```bash
 python test.py --model_name {model_name e.g resnet18, resnet50, swin_v2} --model_path {your_path_to_model_weight.pt}
-
+```
 
