@@ -168,7 +168,7 @@ if __name__ == '__main__':
 
     # for data augmentation
     parser.add_argument('--degree', type=int, default=90)
-    parser.add_argument('--resize', type=int, default=384)
+    parser.add_argument('--resize', type=int, default=224)
 
     args = parser.parse_args()
 
