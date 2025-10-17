@@ -1,2 +1,5 @@
 lab2_*.zip
 data/
+outputs/
+runs/
+weights/
