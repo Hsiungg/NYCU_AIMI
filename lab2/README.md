@@ -16,7 +16,7 @@ The dataset contains chest X-ray images. To download and prepare the dataset:
 unzip lab2_EEG_classification.zip 'lab2_EEG_classification/*' -d temp && mv temp/lab2_EEG_classification/* . && rm -r temp
 ```
 
-1. And the project directory structure should be look like this,
+And the project directory structure should be look like this,
 
 ```text
 project_root/
