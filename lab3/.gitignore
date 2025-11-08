@@ -1,0 +1,5 @@
+*_images/
+*.zip
+*.csv
+output/
+*.txt
