@@ -9,6 +9,7 @@ import pandas as pd
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
 from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
@@ -16,6 +17,12 @@ import json
 
 # HuggingFace Transformers
 from transformers import AutoImageProcessor, AutoModelForImageClassification
+
+try:
+    import timm
+    TIMM_AVAILABLE = True
+except ImportError:
+    TIMM_AVAILABLE = False
 
 # Class labels (must match training)
 LABELS = ['normal', 'bacteria', 'virus', 'COVID-19']
@@ -25,16 +32,20 @@ NUM_CLASSES = len(LABELS)
 class PneumoniaDataset(Dataset):
     """Pneumonia classification dataset for prediction"""
     
-    def __init__(self, csv_path, img_dir, processor):
+    def __init__(self, csv_path, img_dir, processor=None, transform=None, use_timm=False):
         """
         Args:
             csv_path: CSV file path
             img_dir: Image directory
-            processor: HuggingFace image processor
+            processor: HuggingFace image processor (optional)
+            transform: Custom transforms for TIMM models (optional)
+            use_timm: Whether using TIMM model
         """
         self.df = pd.read_csv(csv_path)
         self.img_dir = Path(img_dir)
         self.processor = processor
+        self.transform = transform
+        self.use_timm = use_timm
         
     def __len__(self):
         return len(self.df)
@@ -57,13 +68,30 @@ class PneumoniaDataset(Dataset):
             print(f"Error loading {img_path}: {e}")
             image = Image.new('RGB', (224, 224), (0, 0, 0))
         
-        inputs = self.processor(image, return_tensors="pt")
-        pixel_values = inputs['pixel_values'].squeeze(0)
-        
-        return {
-            'pixel_values': pixel_values,
-            'idx': idx,
-        }
+        if self.use_timm:
+            # TIMM models: use transform (includes ToTensor, Normalize)
+            if self.transform:
+                image = self.transform(image)
+            return {
+                'image': image,
+                'idx': idx,
+            }
+        else:
+            # HuggingFace models
+            if self.transform:
+                image = self.transform(image)
+            
+            # If processor is None, transform already returns a tensor
+            if self.processor is None:
+                pixel_values = image  # Already a tensor from transform
+            else:
+                inputs = self.processor(image, return_tensors="pt")
+                pixel_values = inputs['pixel_values'].squeeze(0)
+            
+            return {
+                'pixel_values': pixel_values,
+                'idx': idx,
+            }
 
 
 def predict_test_set(
@@ -79,49 +107,102 @@ def predict_test_set(
     checkpoint_path = Path(checkpoint_path)
     print(f"\nLoading model from: {checkpoint_path}")
     
-    # Load model
-    try:
-        model = AutoModelForImageClassification.from_pretrained(str(checkpoint_path))
-        print("Model loaded successfully")
-    except Exception as e:
-        print(f"Error: Cannot load model from {checkpoint_path}")
-        print(f"Please ensure the path is correct and contains model files")
-        raise e
+    # Load config to detect model type
+    config_path = checkpoint_path / 'config.json'
+    model_name = None
+    if config_path.exists():
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            model_name = config.get('_name_or_path', '')
+            print(f"Detected model: {model_name}")
     
-    # Try to load processor from multiple locations
+    # Detect model type
+    use_timm = False
+    use_hf_dinov3 = False
+    transform = None
     processor = None
-    processor_paths = [
-        checkpoint_path,  # Try checkpoint directory first
-        checkpoint_path.parent,  # Try parent directory (main output dir)
-    ]
     
-    # Also try to get original model name from config
-    try:
-        config_path = checkpoint_path / 'config.json'
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-                # Some models store the original model name in _name_or_path
-                if '_name_or_path' in config:
-                    processor_paths.append(config['_name_or_path'])
-    except:
-        pass
+    if model_name:
+        # Check if it's a TIMM model (EVA02, etc.)
+        if 'eva02' in model_name.lower():
+            use_timm = True
+            print("Detected EVA02 model - using TIMM transforms")
+            # EVA02 transform
+            transform = transforms.Compose([
+                transforms.Resize(512),
+                transforms.CenterCrop(448),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+        elif 'facebook/dinov3' in model_name.lower() or 'dinov3' in model_name.lower():
+            use_hf_dinov3 = True
+            print("Detected DINOv3 model - using custom transforms")
+            # DINOv3 transform
+            transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(256),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
     
-    for proc_path in processor_paths:
+    # Load model
+    if use_timm:
+        if not TIMM_AVAILABLE:
+            raise ImportError("timm is required for TIMM models. Install with: pip install timm")
+        # Try to load TIMM model
         try:
-            if isinstance(proc_path, str) and not os.path.exists(proc_path):
-                continue
-            processor = AutoImageProcessor.from_pretrained(str(proc_path), use_fast=True)
-            print(f"Processor loaded from: {proc_path}")
-            break
-        except:
-            continue
-    
-    if processor is None:
-        raise FileNotFoundError(
-            f"Cannot find processor. Tried:\n" + 
-            "\n".join([f"  - {p}" for p in processor_paths if isinstance(p, Path) or os.path.exists(str(p))])
-        )
+            print(f"Loading TIMM model: {model_name}")
+            model = timm.create_model(model_name, pretrained=False, num_classes=NUM_CLASSES)
+            # Load weights from checkpoint
+            state_dict_path = checkpoint_path / 'best_model.pth'
+            if not state_dict_path.exists():
+                state_dict_path = checkpoint_path / 'final_model.pth'
+            if state_dict_path.exists():
+                state_dict = torch.load(state_dict_path, map_location='cpu')
+                model.load_state_dict(state_dict)
+                print(f"TIMM model loaded from: {state_dict_path}")
+            else:
+                raise FileNotFoundError(f"Cannot find model weights in {checkpoint_path}")
+        except Exception as e:
+            print(f"Error loading TIMM model: {e}")
+            raise
+    else:
+        # Load HuggingFace model
+        try:
+            model = AutoModelForImageClassification.from_pretrained(str(checkpoint_path))
+            print("HuggingFace model loaded successfully")
+        except Exception as e:
+            print(f"Error: Cannot load model from {checkpoint_path}")
+            print(f"Please ensure the path is correct and contains model files")
+            raise e
+        
+        # For DINOv3, we already have transform, don't need processor
+        if not use_hf_dinov3:
+            # Try to load processor from multiple locations
+            processor_paths = [
+                checkpoint_path,  # Try checkpoint directory first
+                checkpoint_path.parent,  # Try parent directory (main output dir)
+            ]
+            
+            if model_name:
+                processor_paths.append(model_name)
+            
+            for proc_path in processor_paths:
+                try:
+                    if isinstance(proc_path, str) and not os.path.exists(proc_path):
+                        # Try to load from HuggingFace hub
+                        processor = AutoImageProcessor.from_pretrained(proc_path, use_fast=True)
+                        print(f"Processor loaded from: {proc_path}")
+                        break
+                    elif isinstance(proc_path, Path) and proc_path.exists():
+                        processor = AutoImageProcessor.from_pretrained(str(proc_path), use_fast=True)
+                        print(f"Processor loaded from: {proc_path}")
+                        break
+                except Exception as e:
+                    continue
+            
+            if processor is None:
+                print("Warning: Cannot find processor, will use transforms if available")
     
     # Check label mapping
     label_map_paths = [
@@ -144,7 +225,9 @@ def predict_test_set(
     test_dataset = PneumoniaDataset(
         csv_path=test_csv,
         img_dir=test_img_dir,
-        processor=processor
+        processor=processor,
+        transform=transform,
+        use_timm=use_timm or use_hf_dinov3,
     )
     
     print(f"Test set samples: {len(test_dataset)}")
@@ -166,12 +249,18 @@ def predict_test_set(
     print("\nMaking predictions...")
     with torch.no_grad():
         for batch_idx, batch in enumerate(tqdm(test_loader)):
-            pixel_values = batch['pixel_values'].to(device)
+            # Handle different input formats for TIMM vs HuggingFace models
+            if use_timm:
+                # TIMM models use 'image' key
+                images = batch['image'].to(device)
+                logits = model(images)
+            else:
+                # HuggingFace models use 'pixel_values' key
+                pixel_values = batch['pixel_values'].to(device)
+                outputs = model(pixel_values=pixel_values)
+                logits = outputs.logits if hasattr(outputs, 'logits') else outputs
             
-            outputs = model(pixel_values=pixel_values)
-            logits = outputs.logits
-            
-            # 获取预测概率
+            # Get prediction probabilities
             probs = torch.softmax(logits, dim=-1).cpu().numpy()
             preds = np.argmax(probs, axis=1)
             

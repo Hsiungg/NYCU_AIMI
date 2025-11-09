@@ -70,6 +70,13 @@ from transformers import (
 )
 
 try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    print("Warning: wandb not available. Install with: pip install wandb")
+
+try:
     import timm
     from timm.data import create_transform
     TIMM_AVAILABLE = True
@@ -142,8 +149,14 @@ class PneumoniaDataset(Dataset):
             if self.transform:
                 image = self.transform(image)
             
-            inputs = self.processor(image, return_tensors="pt")
-            pixel_values = inputs['pixel_values'].squeeze(0)
+            # If processor is None, transform already returns a tensor (includes ToTensor + Normalize)
+            if self.processor is None:
+                # Transform already includes ToTensor and Normalize
+                pixel_values = image  # image is already a tensor
+            else:
+                # Processor handles resize, normalize, etc.
+                inputs = self.processor(image, return_tensors="pt")
+                pixel_values = inputs['pixel_values'].squeeze(0)
             
             return {
                 'pixel_values': pixel_values,
@@ -246,7 +259,7 @@ class TIMMTrainer:
     def __init__(self, model, train_dataset, val_dataset, class_weights=None, 
                  train_sampler=None, output_dir='./output', num_epochs=10, 
                  batch_size=16, learning_rate=2e-5, early_stopping_patience=10,
-                 device='cuda'):
+                 device='cuda', use_wandb=False):
         self.model = model
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
@@ -271,6 +284,7 @@ class TIMMTrainer:
         
         self.best_f1 = 0.0
         self.patience_counter = 0
+        self.use_wandb = use_wandb
         
     def get_dataloader(self, dataset, shuffle=False, sampler=None):
         return DataLoader(
@@ -282,9 +296,10 @@ class TIMMTrainer:
             pin_memory=True,
         )
     
-    def train_epoch(self, train_loader):
+    def train_epoch(self, train_loader, epoch=0):
         self.model.train()
         total_loss = 0.0
+        num_batches = 0
         
         for batch in tqdm(train_loader, desc="Training"):
             images = batch['image'].to(self.device)
@@ -297,8 +312,23 @@ class TIMMTrainer:
             self.optimizer.step()
             
             total_loss += loss.item()
+            num_batches += 1
+            
+            # Log to wandb during training
+            if self.use_wandb and num_batches % 50 == 0:
+                wandb.log({
+                    'train/loss': loss.item(),
+                    'train/learning_rate': self.optimizer.param_groups[0]['lr'],
+                    'train/epoch': epoch + num_batches / len(train_loader),
+                })
         
-        return total_loss / len(train_loader)
+        avg_loss = total_loss / len(train_loader)
+        if self.use_wandb:
+            wandb.log({
+                'train/epoch_loss': avg_loss,
+                'train/epoch': epoch + 1,
+            })
+        return avg_loss
     
     def evaluate(self, val_loader):
         self.model.eval()
@@ -339,12 +369,23 @@ class TIMMTrainer:
         except:
             auc = 0.0
         
-        return {
+        results = {
             'accuracy': accuracy,
             'f1_macro': f1_macro,
             'f1_weighted': f1_weighted,
             'auc_macro': auc,
         }
+        
+        # Log to wandb
+        if self.use_wandb:
+            wandb.log({
+                'val/accuracy': accuracy,
+                'val/f1_macro': f1_macro,
+                'val/f1_weighted': f1_weighted,
+                'val/auc_macro': auc,
+            })
+        
+        return results
     
     def train(self):
         train_loader = self.get_dataloader(self.train_dataset, shuffle=False, sampler=self.train_sampler)
@@ -355,7 +396,7 @@ class TIMMTrainer:
         for epoch in range(self.num_epochs):
             print(f"\nEpoch {epoch + 1}/{self.num_epochs}")
             
-            train_loss = self.train_epoch(train_loader)
+            train_loss = self.train_epoch(train_loader, epoch=epoch)
             eval_results = self.evaluate(val_loader)
             
             print(f"Train Loss: {train_loss:.4f}")
@@ -363,6 +404,18 @@ class TIMMTrainer:
             print(f"Val F1 Macro: {eval_results['f1_macro']:.4f}")
             print(f"Val F1 Weighted: {eval_results['f1_weighted']:.4f}")
             print(f"Val AUC: {eval_results['auc_macro']:.4f}")
+            
+            # Log epoch-level metrics to wandb
+            if self.use_wandb:
+                wandb.log({
+                    'epoch': epoch + 1,
+                    'train/epoch_loss': train_loss,
+                    'val/accuracy': eval_results['accuracy'],
+                    'val/f1_macro': eval_results['f1_macro'],
+                    'val/f1_weighted': eval_results['f1_weighted'],
+                    'val/auc_macro': eval_results['auc_macro'],
+                    'learning_rate': self.optimizer.param_groups[0]['lr'],
+                })
             
             self.scheduler.step()
             
@@ -403,6 +456,10 @@ def train_model(
     early_stopping_patience=10,
     no_early_stopping=False,
     seed=42,
+    use_wandb=False,
+    wandb_project='pneumonia-classification',
+    wandb_run_name=None,
+    wandb_entity=None,
 ):
     """Train model"""
     
@@ -417,12 +474,44 @@ def train_model(
     set_seed(seed)
     print(f"Set random seed: {seed}")
     
+    # Initialize wandb if requested
+    if use_wandb:
+        if not WANDB_AVAILABLE:
+            raise ImportError("wandb is required but not installed. Install with: pip install wandb")
+        
+        wandb.init(
+            project=wandb_project,
+            name=wandb_run_name,
+            entity=wandb_entity,
+            config={
+                'model_name': model_name,
+                'model_type': model_type,
+                'num_epochs': num_epochs,
+                'batch_size': batch_size,
+                'learning_rate': learning_rate,
+                'use_resample': use_resample,
+                'use_class_weights': use_class_weights,
+                'early_stopping_patience': early_stopping_patience,
+                'no_early_stopping': no_early_stopping,
+                'seed': seed,
+            }
+        )
+        print(f"\n✓ WANDB initialized: project={wandb_project}, run={wandb_run_name}")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
-    use_timm = model_name.startswith('timm/') or 'eva02' in model_name.lower() or 'dinov3' in model_name.lower()
+    # Check if using TIMM models
+    # Note: facebook/dinov3-* models are HuggingFace models, not TIMM
+    use_timm = (model_name.startswith('timm/') or 
+                ('eva02' in model_name.lower() and 'facebook' not in model_name.lower()) or
+                (model_type == 'timm' and 'facebook' not in model_name.lower()))
     
-    if use_timm:
+    # DINOv3 from HuggingFace should use HuggingFace loader, not TIMM
+    use_hf_dinov3 = (model_type == 'dinov3' and 'facebook' in model_name.lower()) or \
+                     ('facebook/dinov3' in model_name.lower())
+    
+    if use_timm and not use_hf_dinov3:
         if not TIMM_AVAILABLE:
             raise ImportError("timm is required for TIMM models. Install with: pip install timm")
         
@@ -452,24 +541,6 @@ def train_model(
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
             print("\nUsing custom transforms for EVA02: Resize(512), CenterCrop(448), RandomHorizontalFlip, ToTensor, Normalize")
-        elif 'dinov3' in timm_model_name.lower():
-            # DINOv3: 256x256 transforms (X-ray specific normalization)
-            train_transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(256),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomRotation(degrees=10),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale
-            ])
-            val_transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(256),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ])
-            print("\nUsing custom transforms for DINOv3: Resize(256), CenterCrop(256), X-ray normalization")
         else:
             # Default TIMM transforms
             data_config = timm.data.resolve_data_config(model.pretrained_cfg)
@@ -489,14 +560,40 @@ def train_model(
         print(f"\nLoading HuggingFace model: {model_name}")
         processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
         
-        train_transform = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomRotation(degrees=10),
-            transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
-            transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-        ])
-        val_transform = None
-        print("\nUsing data augmentation: RandomHorizontalFlip, RandomRotation, RandomAffine, ColorJitter")
+        # Custom transforms for DINOv3 from HuggingFace
+        if use_hf_dinov3 or 'facebook/dinov3' in model_name.lower():
+            # DINOv3: disable processor's automatic processing, do everything manually
+            processor.do_resize = False  # Disable automatic resize
+            processor.do_center_crop = False  # Disable automatic center crop
+            processor.do_normalize = False  # Disable automatic normalize, do it manually
+            
+            # Manual resize, crop, augmentation, and X-ray normalization
+            train_transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(256),  # Manual center crop
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
+            ])
+            val_transform = transforms.Compose([
+                transforms.Resize(256),
+                transforms.CenterCrop(256),  # Manual center crop
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
+            ])
+            # Set processor to None since we're doing everything manually
+            processor = None
+            print("\nUsing DINOv3: manual resize/crop/normalize in transform (X-ray normalization)")
+        else:
+            # Standard HuggingFace models (ViT, Swin)
+            train_transform = transforms.Compose([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=10),
+                transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+            ])
+            val_transform = None
+            print("\nUsing data augmentation: RandomHorizontalFlip, RandomRotation, RandomAffine, ColorJitter")
     
     print("\nLoading datasets...")
     train_dataset = PneumoniaDataset(
@@ -525,7 +622,7 @@ def train_model(
         class_weights = calculate_class_weights(train_dataset)
         class_weights = class_weights.tolist()
     
-    if not use_timm:
+    if not use_timm or use_hf_dinov3:
         print(f"\nLoading pretrained model: {model_name}")
         model = AutoModelForImageClassification.from_pretrained(
             model_name,
@@ -533,7 +630,7 @@ def train_model(
             ignore_mismatched_sizes=True
         )
     
-    if use_timm:
+    if use_timm and not use_hf_dinov3:
         train_sampler = None
         if use_resample:
             train_sampler = create_weighted_sampler(train_dataset)
@@ -551,6 +648,7 @@ def train_model(
             learning_rate=learning_rate,
             early_stopping_patience=early_stopping_patience if not no_early_stopping else num_epochs,
             device=device,
+            use_wandb=use_wandb,
         )
         
         print("\nStarting training...")
@@ -566,9 +664,17 @@ def train_model(
         print(f"\nSaving model to: {output_dir}")
         trainer.save_model()
         
+        # Finish wandb run
+        if use_wandb:
+            wandb.finish()
+            print("✓ WANDB run finished")
+        
         return trainer, model, None
     
     else:
+        # Determine reporting backend
+        report_to = "wandb" if use_wandb else "none"
+        
         training_args = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
@@ -586,7 +692,7 @@ def train_model(
             save_total_limit=3,
             fp16=torch.cuda.is_available(),
             dataloader_num_workers=4,
-            report_to="none",
+            report_to=report_to,
             seed=seed,
             data_seed=seed,
         )
@@ -648,6 +754,11 @@ def train_model(
         with open(f'{output_dir}/label_map.json', 'w') as f:
             json.dump(label_map, f, indent=2)
         
+        # Finish wandb run
+        if use_wandb:
+            wandb.finish()
+            print("✓ WANDB run finished")
+        
         print("\nTraining complete!")
         return trainer, model, processor
 
@@ -666,8 +777,8 @@ def main():
     
     model_type = 'timm'
     parser.add_argument('--model_type', type=str, default=model_type,
-                        choices=['vit', 'swin', 'timm'],
-                        help='Model type: vit, swin, or timm')
+                        choices=['vit', 'swin', 'timm', 'dinov3'],
+                        help='Model type: vit, swin, timm, or dinov3')
     parser.add_argument('--model_name', type=str, default=None,
                         help='Pretrained model name (optional, defaults based on model_type)')
     
@@ -697,6 +808,16 @@ def main():
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42)')
     
+    # WANDB arguments
+    parser.add_argument('--use_wandb', action='store_true', default=True,
+                        help='Use Weights & Biases for logging')
+    parser.add_argument('--wandb_project', type=str, default='pneumonia-classification',
+                        help='WANDB project name (default: pneumonia-classification)')
+    parser.add_argument('--wandb_run_name', type=str, default=None,
+                        help='WANDB run name (default: auto-generated from config)')
+    parser.add_argument('--wandb_entity', type=str, default=None,
+                        help='WANDB entity/team name (optional)')
+    
     args = parser.parse_args()
     
     if args.model_name is None:
@@ -706,9 +827,15 @@ def main():
             args.model_name = 'microsoft/swin-base-patch4-window7-224'
         elif args.model_type == 'timm':
             args.model_name = 'eva02_large_patch14_448.mim_m38m_ft_in22k_in1k'
+        elif args.model_type == 'dinov3':
+            args.model_name = 'facebook/dinov3-vitb16-pretrain-lvd1689m'  # Default, can override with --model_name facebook/dinov3-vitb16-pretrain-lvd1689m
     
     if args.output_dir is None:
         args.output_dir = f'./output/{args.model_type}_model'
+    
+    # Auto-generate wandb_run_name if not provided
+    if args.wandb_run_name is None:
+        args.wandb_run_name = f"{args.model_type}_{args.model_name.split('/')[-1]}_resample{args.use_resample}_weights{args.use_class_weights}_pat{args.early_stopping_patience}_seed{args.seed}"
     
     trainer, model, processor = train_model(
         model_name=args.model_name,
@@ -726,6 +853,10 @@ def main():
         early_stopping_patience=args.early_stopping_patience,
         no_early_stopping=args.no_early_stopping,
         seed=args.seed,
+        use_wandb=args.use_wandb,
+        wandb_project=args.wandb_project,
+        wandb_run_name=args.wandb_run_name,
+        wandb_entity=args.wandb_entity,
     )
     
     print("\nTraining complete! Use predict.py script to make predictions on test set.")
