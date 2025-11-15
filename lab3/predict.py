@@ -140,6 +140,38 @@ def predict_test_set(
             model_name = config.get('_name_or_path', '')
             print(f"Detected model from config: {model_name}")
     
+    # Check if this is a TIMM model checkpoint (has .pth files but no config.json)
+    has_pth_file = (checkpoint_path / 'best_model.pth').exists() or (checkpoint_path / 'final_model.pth').exists()
+    is_timm_checkpoint = has_pth_file and not config_path.exists()
+    
+    # If model_name is not found, try to detect from checkpoint path or structure
+    if not model_name:
+        checkpoint_path_str = str(checkpoint_path).lower()
+        
+        def select_beit_variant(path_str: str) -> str:
+            if 'beit_base' in path_str or 'beit-base' in path_str or 'beitb' in path_str:
+                return 'timm/beit_base_patch16_224.in22k_ft_in22k_in1k'
+            if 'beit_large' in path_str or 'beit-large' in path_str or 'beitl' in path_str:
+                return 'timm/beit_large_patch16_512.in22k_ft_in22k_in1k'
+            return 'timm/beit_large_patch16_512.in22k_ft_in22k_in1k'
+        
+        if 'beit' in checkpoint_path_str:
+            model_name = select_beit_variant(checkpoint_path_str)
+            print(f"Detected BEIT from path, using default: {model_name}")
+        elif 'eva02' in checkpoint_path_str:
+            model_name = 'timm/eva02_base_patch14_448.mim_in22k_ft_in22k_in1k'  # Default EVA02 model
+            print(f"Detected EVA02 from path, using default: {model_name}")
+        elif is_timm_checkpoint or 'timm' in checkpoint_path_str:
+            # If it's a TIMM checkpoint structure, try to detect from path or use common models
+            if 'beit' in checkpoint_path_str:
+                model_name = select_beit_variant(checkpoint_path_str)
+            elif 'eva02' in checkpoint_path_str:
+                model_name = 'timm/eva02_base_patch14_448.mim_in22k_ft_in22k_in1k'
+            else:
+                # Default to BEIT if path contains timm but no specific model name
+                model_name = select_beit_variant(checkpoint_path_str)
+            print(f"Detected TIMM checkpoint structure, using default: {model_name}")
+    
     # Detect model type
     use_timm = False
     transform = None
@@ -167,12 +199,25 @@ def predict_test_set(
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
     elif model_name:
-        # Check if it's a TIMM model from config
+        # Check if it's a TIMM model (EVA02, BEIT, DINOv3, etc.)
         if 'eva02' in model_name.lower() and 'facebook' not in model_name.lower():
             use_timm = True
             print("Detected EVA02 model - using TIMM transforms")
             transform = transforms.Compose([
                 transforms.Resize((448, 448)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+        elif 'beit' in model_name.lower():
+            use_timm = True
+            print("Detected BEIT model - using TIMM transforms")
+            # Select BEIT input size: base -> 224, large -> 512
+            beit_size = 512
+            lower_name = model_name.lower()
+            if 'beit_base' in lower_name or 'patch16_224' in lower_name:
+                beit_size = 224
+            transform = transforms.Compose([
+                transforms.Resize((beit_size, beit_size)),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
@@ -185,24 +230,90 @@ def predict_test_set(
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
     
+    # If model_name is still None but we detected TIMM checkpoint structure, use default BEIT
+    if not model_name and is_timm_checkpoint:
+        model_name = 'timm/beit_large_patch16_512.in22k_ft_in22k_in1k'
+        use_timm = True
+        print("Detected TIMM checkpoint structure (no config.json), defaulting to BEIT model")
+        transform = transforms.Compose([
+            transforms.Resize((512, 512)),  # Resize to 512x512
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
+        ])
+    
     # Load model
     if use_timm:
         if not TIMM_AVAILABLE:
             raise ImportError("timm is required for TIMM models. Install with: pip install timm")
         # Load TIMM model
         try:
-            print(f"Loading TIMM model: {model_name}")
-            model = timm.create_model(model_name, pretrained=False, num_classes=NUM_CLASSES)
-            # Load weights from checkpoint
+            # Determine weight file
             state_dict_path = checkpoint_path / 'best_model.pth'
             if not state_dict_path.exists():
                 state_dict_path = checkpoint_path / 'final_model.pth'
-            if state_dict_path.exists():
-                state_dict = torch.load(state_dict_path, map_location='cpu')
-                model.load_state_dict(state_dict)
-                print(f"TIMM model loaded from: {state_dict_path}")
-            else:
+            if not state_dict_path.exists():
                 raise FileNotFoundError(f"Cannot find model weights in {checkpoint_path}")
+            
+            state_dict = torch.load(state_dict_path, map_location='cpu')
+            
+            # Handle wrapped checkpoints (e.g., {'model_state_dict': ...})
+            if isinstance(state_dict, dict):
+                if 'state_dict' in state_dict:
+                    state_dict = state_dict['state_dict']
+                elif 'model_state_dict' in state_dict:
+                    state_dict = state_dict['model_state_dict']
+            
+            # Remove potential 'module.' prefixes from DataParallel checkpoints
+            if isinstance(state_dict, dict):
+                keys = list(state_dict.keys())
+                if all(k.startswith('module.') for k in keys):
+                    state_dict = {k.replace('module.', '', 1): v for k, v in state_dict.items()}
+            
+            # Remove 'timm/' prefix if present (same as training code)
+            timm_model_name = model_name.replace('timm/', '') if model_name and model_name.startswith('timm/') else model_name
+            
+            # Auto-detect BEIT base vs large from checkpoint layer sizes
+            if timm_model_name and 'beit' in timm_model_name.lower() and isinstance(state_dict, dict):
+                head_weight_key = None
+                for candidate_key in ['head.weight', 'fc.weight', 'classifier.weight']:
+                    if candidate_key in state_dict:
+                        head_weight_key = candidate_key
+                        break
+                if head_weight_key is None:
+                    # Try to find key with suffix
+                    for key in state_dict.keys():
+                        if key.endswith('head.weight'):
+                            head_weight_key = key
+                            break
+                
+                embed_dim = None
+                if head_weight_key is not None:
+                    embed_dim = state_dict[head_weight_key].shape[1]
+                
+                if embed_dim is not None:
+                    if embed_dim <= 768 and 'beit_base' not in timm_model_name.lower():
+                        print(f"Detected BEIT base checkpoint (embed_dim={embed_dim}), switching model architecture")
+                        timm_model_name = 'beit_base_patch16_224.in22k_ft_in22k_in1k'
+                    elif embed_dim > 768 and 'beit_large' not in timm_model_name.lower():
+                        print(f"Detected BEIT large checkpoint (embed_dim={embed_dim}), switching model architecture")
+                        timm_model_name = 'beit_large_patch16_512.in22k_ft_in22k_in1k'
+            
+            # Update transform for BEIT based on detected variant after auto-detect
+            if isinstance(timm_model_name, str) and 'beit' in timm_model_name.lower():
+                beit_size = 512
+                lname = timm_model_name.lower()
+                if 'beit_base' in lname or 'patch16_224' in lname:
+                    beit_size = 224
+                transform = transforms.Compose([
+                    transforms.Resize((beit_size, beit_size)),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                ])
+            
+            print(f"Loading TIMM model: {timm_model_name}")
+            model = timm.create_model(timm_model_name, pretrained=False, num_classes=NUM_CLASSES)
+            model.load_state_dict(state_dict)
+            print(f"TIMM model loaded from: {state_dict_path}")
         except Exception as e:
             print(f"Error loading TIMM model: {e}")
             raise

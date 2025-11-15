@@ -551,38 +551,53 @@ def train_model(
         
         # Custom transforms for specific models
         if 'eva02' in timm_model_name.lower():
-            # EVA02: Resize(512), CenterCrop(448), RandomHorizontalFlip, ToTensor, Normalize
+            # EVA02: Resize then CenterCrop to ensure fixed size, RandomHorizontalFlip, ToTensor, Normalize
             train_transform = transforms.Compose([
-                transforms.Resize(512),
-                transforms.CenterCrop(448),
+                transforms.Resize((448, 448)),  # Resize short edge to 448, maintain aspect ratio
+                #transforms.CenterCrop(448),  # Center crop to 448x448 to ensure fixed size
                 transforms.RandomHorizontalFlip(),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale (RGB channels)
             ])
             val_transform = transforms.Compose([
-                transforms.Resize(512),
-                transforms.CenterCrop(448),
+                transforms.Resize((448, 448)),  # Resize short edge to 448, maintain aspect ratio
+                #transforms.CenterCrop(448),  # Center crop to 448x448 to ensure fixed size
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
             print("\nUsing custom transforms for EVA02: Resize(512), CenterCrop(448), RandomHorizontalFlip, ToTensor, Normalize")
-        elif 'dinov3' in timm_model_name.lower() or model_type == 'dinov3':
-            # DINOv3: Direct resize to 256x256 (no crop to preserve full image)
-            # Note: Most chest X-rays are landscape ~1.43 aspect ratio
-            # Using direct resize instead of CenterCrop to avoid losing ~26% of lung area
+        elif 'beit' in timm_model_name.lower():
+            # BEIT: 512x512 with X-ray normalization
             train_transform = transforms.Compose([
-                transforms.Resize((256, 256)),  # Direct resize to 256x256 (preserves full image)
+                transforms.Resize((224, 224)),  # Resize to 512x512
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomRotation(degrees=10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
             ])
             val_transform = transforms.Compose([
-                transforms.Resize((256, 256)),  # Direct resize to 256x256
+                transforms.Resize((224, 224)),  # Resize to 512x512
                 transforms.ToTensor(),
-                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
             ])
-            print("\nUsing DINOv3: direct resize to 256x256 (no crop, preserves full lung area)")
+            print("\nUsing custom transforms for BEIT: Resize(512x512), X-ray normalization")
+        elif 'beit' in timm_model_name.lower():
+            # BEIT: 512x512 with X-ray normalization
+            train_transform = transforms.Compose([
+                transforms.Resize((224, 224)),  # Resize to 512x512
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
+            ])
+            val_transform = transforms.Compose([
+                transforms.Resize((224, 224)),  # Resize to 512x512
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
+            ])
+            print("\nUsing custom transforms for BEIT: Resize(512x512), X-ray normalization")
         else:
             # Default TIMM transforms
             data_config = timm.data.resolve_data_config(model.pretrained_cfg)
@@ -859,7 +874,7 @@ def main():
     parser.add_argument('--val_img_dir', type=str, default='val_images',
                         help='Validation image directory')
     
-    model_type = 'dinov2'
+    model_type = 'timm'
     parser.add_argument('--model_type', type=str, default=model_type,
                         choices=['vit', 'swin', 'timm', 'dinov2', 'dinov3'],
                         help='Model type: vit, swin, timm, dinov2, or dinov3')
@@ -870,9 +885,9 @@ def main():
                         help='Output directory')
     parser.add_argument('--num_epochs', type=int, default=100,
                         help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=32,
+    parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size')
-    parser.add_argument('--learning_rate', type=float, default=2e-5,
+    parser.add_argument('--learning_rate', type=float, default=5e-5,
                         help='Learning rate')
     
     parser.add_argument('--use_resample', action='store_true', default=True,
@@ -911,8 +926,6 @@ def main():
             args.model_name = 'microsoft/swin-base-patch4-window7-224'  # Default Swin V1 model
         elif args.model_type == 'timm':
             args.model_name = 'eva02_large_patch14_448.mim_m38m_ft_in22k_in1k'
-        elif args.model_type == 'dinov2':
-            args.model_name = 'facebook/dinov2-base'  # Default DINOv2 model
         elif args.model_type == 'dinov3':
             args.model_name = 'vit_base_patch16_dinov3.lvd1689m'  # TIMM DINOv3 model
     
