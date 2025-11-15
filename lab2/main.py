@@ -229,7 +229,7 @@ if __name__ == '__main__':
     parser.add_argument("-model", type=str, default="EEGNet",
                         choices=["EEGNet", "DeepConvNet"])
     parser.add_argument("-out_dir", type=str, default="outputs")
-    parser.add_argument("-seed", type=int, default=42)
+    parser.add_argument("-seed", type=int, default=0)
     parser.add_argument("-num_workers", type=int, default=0)
     # Grid search options
     parser.add_argument("-grid_search", action="store_true")

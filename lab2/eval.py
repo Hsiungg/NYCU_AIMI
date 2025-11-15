@@ -50,13 +50,16 @@ def build_model(args) -> nn.Module:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-batch_size", type=int, default=512)
-    parser.add_argument("-activation_function", type=str, default="relu", choices=["relu", "leakyrelu", "elu", "selu"]) 
+    parser.add_argument("-activation_function", type=str,
+                        default="relu", choices=["relu", "leakyrelu", "elu", "selu"])
     parser.add_argument("-elu_alpha", type=float, default=0.1)
     parser.add_argument("-dropout_rate", type=float, default=0.1)
-    parser.add_argument("-model", type=str, default="EEGNet", choices=["EEGNet", "DeepConvNet"])
+    parser.add_argument("-model", type=str, default="EEGNet",
+                        choices=["EEGNet", "DeepConvNet"])
     parser.add_argument("-lr", type=float, default=0.001)
-    parser.add_argument("-weights", type=str, default="", help="Path to weights .pt file. If empty, infer from naming.")
-    parser.add_argument("-seed", type=int, default=0)
+    parser.add_argument("-weights", type=str, default="",
+                        help="Path to weights .pt file. If empty, infer from naming.")
+    parser.add_argument("-seed", type=int, default=444444)
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -67,7 +70,8 @@ def main():
     # Prepare data
     _, _, test_data, test_label = dataloader.read_bci_data()
     test_dataset = BCIDataset(test_data, test_label)
-    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False)
+    test_loader = DataLoader(
+        test_dataset, batch_size=args.batch_size, shuffle=False)
 
     # Build and load model
     model = build_model(args)
@@ -90,5 +94,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
