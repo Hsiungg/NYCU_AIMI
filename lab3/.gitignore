@@ -3,3 +3,4 @@
 *.csv
 output/
 *.txt
+wandb/

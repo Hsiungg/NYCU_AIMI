@@ -7,6 +7,13 @@ Output format compatible with Kaggle submission requirements
 import os
 import sys
 import subprocess
+import platform
+
+# Detect OS and set appropriate num_workers for DataLoader
+IS_WINDOWS = platform.system() == 'Windows'
+NUM_WORKERS = 4 if IS_WINDOWS else 7  # Windows: use 2-4 workers, Linux: use 8
+PERSISTENT_WORKERS = NUM_WORKERS > 0  # Enable persistent workers if using multiprocessing
+print(f"Detected OS: {platform.system()}, using num_workers={NUM_WORKERS}, persistent_workers={PERSISTENT_WORKERS}")
 
 def setup_cuda_environment():
     """Setup CUDA environment variables to ensure nvcc can be found"""
@@ -40,7 +47,7 @@ def setup_cuda_environment():
     except:
         pass
     
-    print("Warning: nvcc not found, deepspeed may not work properly")
+    # nvcc not found - CUDA training will still work with PyTorch
 
 setup_cuda_environment()
 
@@ -108,6 +115,9 @@ class PneumoniaDataset(Dataset):
         self.is_training = is_training
         self.use_timm = use_timm
         
+        # Pre-import ToTensor to avoid issues with multiprocessing
+        self.to_tensor = transforms.ToTensor()
+        
         self.labels = []
         for _, row in self.df.iterrows():
             label_vec = [row[label] for label in LABELS]
@@ -140,6 +150,9 @@ class PneumoniaDataset(Dataset):
         if self.use_timm:
             if self.transform:
                 image = self.transform(image)
+            else:
+                # If no transform, at least convert to tensor
+                image = self.to_tensor(image)
             return {
                 'image': image,
                 'labels': torch.tensor(self.labels[idx], dtype=torch.long),
@@ -153,6 +166,9 @@ class PneumoniaDataset(Dataset):
             if self.processor is None:
                 # Transform already includes ToTensor and Normalize
                 pixel_values = image  # image is already a tensor
+                # Safety check: if still PIL Image, convert to tensor
+                if not isinstance(pixel_values, torch.Tensor):
+                    pixel_values = self.to_tensor(pixel_values)
             else:
                 # Processor handles resize, normalize, etc.
                 inputs = self.processor(image, return_tensors="pt")
@@ -292,8 +308,9 @@ class TIMMTrainer:
             batch_size=self.batch_size,
             shuffle=shuffle,
             sampler=sampler,
-            num_workers=4,
+            num_workers=NUM_WORKERS,
             pin_memory=True,
+            persistent_workers=PERSISTENT_WORKERS,
         )
     
     def train_epoch(self, train_loader, epoch=0):
@@ -438,6 +455,13 @@ class TIMMTrainer:
         label_map = {i: label for i, label in enumerate(LABELS)}
         with open(self.output_dir / 'label_map.json', 'w') as f:
             json.dump(label_map, f, indent=2)
+        
+        # Save best metrics
+        metrics = {
+            'best_f1_macro': float(self.best_f1),
+        }
+        with open(self.output_dir / 'best_metrics.json', 'w') as f:
+            json.dump(metrics, f, indent=2)
 
 
 def train_model(
@@ -502,16 +526,17 @@ def train_model(
     print(f"Using device: {device}")
     
     # Check if using TIMM models
-    # Note: facebook/dinov3-* models are HuggingFace models, not TIMM
+    # Note: DINOv3 uses TIMM, DINOv2 uses HuggingFace
     use_timm = (model_name.startswith('timm/') or 
                 ('eva02' in model_name.lower() and 'facebook' not in model_name.lower()) or
-                (model_type == 'timm' and 'facebook' not in model_name.lower()))
+                (model_type == 'timm' and 'facebook' not in model_name.lower()) or
+                model_type == 'dinov3')
     
-    # DINOv3 from HuggingFace should use HuggingFace loader, not TIMM
-    use_hf_dinov3 = (model_type == 'dinov3' and 'facebook' in model_name.lower()) or \
-                     ('facebook/dinov3' in model_name.lower())
+    # DINOv2 from HuggingFace should use HuggingFace loader, not TIMM
+    use_hf_dinov2 = (model_type == 'dinov2' and 'facebook' in model_name.lower()) or \
+                     ('facebook/dinov2' in model_name.lower())
     
-    if use_timm and not use_hf_dinov3:
+    if use_timm and not use_hf_dinov2:
         if not TIMM_AVAILABLE:
             raise ImportError("timm is required for TIMM models. Install with: pip install timm")
         
@@ -541,6 +566,23 @@ def train_model(
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
             print("\nUsing custom transforms for EVA02: Resize(512), CenterCrop(448), RandomHorizontalFlip, ToTensor, Normalize")
+        elif 'dinov3' in timm_model_name.lower() or model_type == 'dinov3':
+            # DINOv3: Direct resize to 256x256 (no crop to preserve full image)
+            # Note: Most chest X-rays are landscape ~1.43 aspect ratio
+            # Using direct resize instead of CenterCrop to avoid losing ~26% of lung area
+            train_transform = transforms.Compose([
+                transforms.Resize((256, 256)),  # Direct resize to 256x256 (preserves full image)
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=10),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
+            ])
+            val_transform = transforms.Compose([
+                transforms.Resize((256, 256)),  # Direct resize to 256x256
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+            print("\nUsing DINOv3: direct resize to 256x256 (no crop, preserves full lung area)")
         else:
             # Default TIMM transforms
             data_config = timm.data.resolve_data_config(model.pretrained_cfg)
@@ -560,40 +602,74 @@ def train_model(
         print(f"\nLoading HuggingFace model: {model_name}")
         processor = AutoImageProcessor.from_pretrained(model_name, use_fast=True)
         
-        # Custom transforms for DINOv3 from HuggingFace
-        if use_hf_dinov3 or 'facebook/dinov3' in model_name.lower():
-            # DINOv3: disable processor's automatic processing, do everything manually
+        # Custom transforms for DINOv2 from HuggingFace
+        if use_hf_dinov2 or 'facebook/dinov2' in model_name.lower():
+            # DINOv2: disable processor's automatic processing, do everything manually
             processor.do_resize = False  # Disable automatic resize
             processor.do_center_crop = False  # Disable automatic center crop
             processor.do_normalize = False  # Disable automatic normalize, do it manually
             
-            # Manual resize, crop, augmentation, and X-ray normalization
+            # Direct resize to 256x256 (no crop to preserve full chest X-ray image)
+            # Note: Most chest X-rays are landscape ~1.43 aspect ratio
+            # Using direct resize instead of CenterCrop to avoid losing ~26% of lung area
             train_transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(256),  # Manual center crop
+                transforms.Resize((256, 256)),  # Direct resize to 256x256 (preserves full image)
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomRotation(degrees=10),
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
             ])
             val_transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(256),  # Manual center crop
+                transforms.Resize((256, 256)),  # Direct resize to 256x256
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),  # X-ray grayscale normalization
             ])
             # Set processor to None since we're doing everything manually
             processor = None
-            print("\nUsing DINOv3: manual resize/crop/normalize in transform (X-ray normalization)")
-        else:
-            # Standard HuggingFace models (ViT, Swin)
+            print("\nUsing DINOv2: direct resize to 256x256 (no crop, preserves full lung area)")
+        elif 'swinv2' in model_name.lower() and '384' in model_name.lower():
+            # Swin V2 with 384x384 resolution: disable processor, do manual resize
+            # The 192to384 models are trained for 384x384 input
+            processor.do_resize = False
+            processor.do_center_crop = False
+            processor.do_normalize = False
+            processor = None  # Use manual transforms
+            
             train_transform = transforms.Compose([
+                transforms.Resize((384, 384)),  # Direct resize to 384x384 (no crop)
                 transforms.RandomHorizontalFlip(p=0.5),
                 transforms.RandomRotation(degrees=10),
                 transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet normalization
             ])
-            val_transform = None
-            print("\nUsing data augmentation: RandomHorizontalFlip, RandomRotation, RandomAffine, ColorJitter")
+            val_transform = transforms.Compose([
+                transforms.Resize((384, 384)),  # Direct resize to 384x384
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            print("\nUsing Swin V2 with 384x384 direct resize (no crop) + data augmentation")
+        else:
+            # Standard HuggingFace models (ViT, Swin V1): direct resize to 224x224 (no crop)
+            processor.do_resize = False
+            processor.do_center_crop = False
+            processor.do_normalize = False
+            processor = None  # Use manual transforms
+            
+            train_transform = transforms.Compose([
+                transforms.Resize((224, 224)),  # Direct resize to 224x224 (no crop)
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.RandomRotation(degrees=10),
+                transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),  # ImageNet normalization
+            ])
+            val_transform = transforms.Compose([
+                transforms.Resize((224, 224)),  # Direct resize to 224x224
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+            print("\nUsing ViT/Swin with 224x224 direct resize (no crop) + data augmentation")
     
     print("\nLoading datasets...")
     train_dataset = PneumoniaDataset(
@@ -622,7 +698,7 @@ def train_model(
         class_weights = calculate_class_weights(train_dataset)
         class_weights = class_weights.tolist()
     
-    if not use_timm or use_hf_dinov3:
+    if not use_timm or use_hf_dinov2:
         print(f"\nLoading pretrained model: {model_name}")
         model = AutoModelForImageClassification.from_pretrained(
             model_name,
@@ -630,7 +706,7 @@ def train_model(
             ignore_mismatched_sizes=True
         )
     
-    if use_timm and not use_hf_dinov3:
+    if use_timm and not use_hf_dinov2:
         train_sampler = None
         if use_resample:
             train_sampler = create_weighted_sampler(train_dataset)
@@ -691,7 +767,8 @@ def train_model(
             greater_is_better=True,
             save_total_limit=3,
             fp16=torch.cuda.is_available(),
-            dataloader_num_workers=4,
+            dataloader_num_workers=NUM_WORKERS,
+            dataloader_persistent_workers=PERSISTENT_WORKERS,
             report_to=report_to,
             seed=seed,
             data_seed=seed,
@@ -713,8 +790,9 @@ def train_model(
                         self.train_dataset,
                         batch_size=self.args.per_device_train_batch_size,
                         sampler=self.train_sampler,
-                        num_workers=self.args.dataloader_num_workers,
+                        num_workers=NUM_WORKERS,
                         pin_memory=True,
+                        persistent_workers=PERSISTENT_WORKERS,
                     )
                 else:
                     return super().get_train_dataloader()
@@ -748,7 +826,13 @@ def train_model(
         
         print(f"\nSaving model to: {output_dir}")
         trainer.save_model()
-        processor.save_pretrained(output_dir)
+        
+        # Only save processor if it exists (None for models with custom transforms)
+        if processor is not None:
+            processor.save_pretrained(output_dir)
+            print("Processor saved")
+        else:
+            print("No processor to save (using custom transforms)")
         
         label_map = {i: label for i, label in enumerate(LABELS)}
         with open(f'{output_dir}/label_map.json', 'w') as f:
@@ -775,10 +859,10 @@ def main():
     parser.add_argument('--val_img_dir', type=str, default='val_images',
                         help='Validation image directory')
     
-    model_type = 'timm'
+    model_type = 'dinov2'
     parser.add_argument('--model_type', type=str, default=model_type,
-                        choices=['vit', 'swin', 'timm', 'dinov3'],
-                        help='Model type: vit, swin, timm, or dinov3')
+                        choices=['vit', 'swin', 'timm', 'dinov2', 'dinov3'],
+                        help='Model type: vit, swin, timm, dinov2, or dinov3')
     parser.add_argument('--model_name', type=str, default=None,
                         help='Pretrained model name (optional, defaults based on model_type)')
     
@@ -786,7 +870,7 @@ def main():
                         help='Output directory')
     parser.add_argument('--num_epochs', type=int, default=100,
                         help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=8,
+    parser.add_argument('--batch_size', type=int, default=32,
                         help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=2e-5,
                         help='Learning rate')
@@ -824,11 +908,13 @@ def main():
         if args.model_type == 'vit':
             args.model_name = 'google/vit-base-patch16-224'
         elif args.model_type == 'swin':
-            args.model_name = 'microsoft/swin-base-patch4-window7-224'
+            args.model_name = 'microsoft/swin-base-patch4-window7-224'  # Default Swin V1 model
         elif args.model_type == 'timm':
             args.model_name = 'eva02_large_patch14_448.mim_m38m_ft_in22k_in1k'
+        elif args.model_type == 'dinov2':
+            args.model_name = 'facebook/dinov2-base'  # Default DINOv2 model
         elif args.model_type == 'dinov3':
-            args.model_name = 'facebook/dinov3-vitb16-pretrain-lvd1689m'  # Default, can override with --model_name facebook/dinov3-vitb16-pretrain-lvd1689m
+            args.model_name = 'vit_base_patch16_dinov3.lvd1689m'  # TIMM DINOv3 model
     
     if args.output_dir is None:
         args.output_dir = f'./output/{args.model_type}_model'

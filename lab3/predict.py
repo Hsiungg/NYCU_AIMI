@@ -14,6 +14,7 @@ from PIL import Image
 from pathlib import Path
 from tqdm import tqdm
 import json
+import platform
 
 # HuggingFace Transformers
 from transformers import AutoImageProcessor, AutoModelForImageClassification
@@ -27,6 +28,10 @@ except ImportError:
 # Class labels (must match training)
 LABELS = ['normal', 'bacteria', 'virus', 'COVID-19']
 NUM_CLASSES = len(LABELS)
+
+# Detect OS for DataLoader settings
+IS_WINDOWS = platform.system() == 'Windows'
+PREDICT_NUM_WORKERS = 0 if IS_WINDOWS else 4  # Windows: disable multiprocessing to avoid issues
 
 
 class PneumoniaDataset(Dataset):
@@ -46,6 +51,9 @@ class PneumoniaDataset(Dataset):
         self.processor = processor
         self.transform = transform
         self.use_timm = use_timm
+        
+        # Pre-import ToTensor to avoid issues with multiprocessing
+        self.to_tensor = transforms.ToTensor()
         
     def __len__(self):
         return len(self.df)
@@ -72,6 +80,9 @@ class PneumoniaDataset(Dataset):
             # TIMM models: use transform (includes ToTensor, Normalize)
             if self.transform:
                 image = self.transform(image)
+            else:
+                # If no transform, at least convert to tensor
+                image = self.to_tensor(image)
             return {
                 'image': image,
                 'idx': idx,
@@ -84,6 +95,9 @@ class PneumoniaDataset(Dataset):
             # If processor is None, transform already returns a tensor
             if self.processor is None:
                 pixel_values = image  # Already a tensor from transform
+                # Safety check: if still PIL Image, convert to tensor
+                if not isinstance(pixel_values, torch.Tensor):
+                    pixel_values = self.to_tensor(pixel_values)
             else:
                 inputs = self.processor(image, return_tensors="pt")
                 pixel_values = inputs['pixel_values'].squeeze(0)
@@ -105,7 +119,17 @@ def predict_test_set(
     """Predict on test set and update CSV"""
     
     checkpoint_path = Path(checkpoint_path)
+    
+    # If checkpoint_path points to a .pth file, use its parent directory
+    if checkpoint_path.is_file() and checkpoint_path.suffix == '.pth':
+        print(f"Detected .pth file, using parent directory: {checkpoint_path.parent}")
+        checkpoint_path = checkpoint_path.parent
+    
     print(f"\nLoading model from: {checkpoint_path}")
+    
+    # Check if it's a TIMM model (has .pth files but no config.json)
+    has_pth = (checkpoint_path / 'best_model.pth').exists() or (checkpoint_path / 'final_model.pth').exists()
+    has_config = (checkpoint_path / 'config.json').exists()
     
     # Load config to detect model type
     config_path = checkpoint_path / 'config.json'
@@ -114,33 +138,49 @@ def predict_test_set(
         with open(config_path, 'r') as f:
             config = json.load(f)
             model_name = config.get('_name_or_path', '')
-            print(f"Detected model: {model_name}")
+            print(f"Detected model from config: {model_name}")
     
     # Detect model type
     use_timm = False
-    use_hf_dinov3 = False
     transform = None
     processor = None
     
-    if model_name:
-        # Check if it's a TIMM model (EVA02, etc.)
-        if 'eva02' in model_name.lower():
-            use_timm = True
-            print("Detected EVA02 model - using TIMM transforms")
-            # EVA02 transform
+    # If has .pth but no config.json, it's a TIMM model
+    if has_pth and not has_config:
+        use_timm = True
+        # Try to detect model name from directory name
+        dir_name = checkpoint_path.name
+        if 'dinov3' in dir_name.lower():
+            model_name = 'vit_base_patch16_dinov3.lvd1689m'  # Default DINOv3 model
+            print(f"Detected TIMM DINOv3 model from directory name")
             transform = transforms.Compose([
-                transforms.Resize(512),
-                transforms.CenterCrop(448),
+                transforms.Resize((256, 256)),  # Direct resize to preserve full image
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
-        elif 'facebook/dinov3' in model_name.lower() or 'dinov3' in model_name.lower():
-            use_hf_dinov3 = True
-            print("Detected DINOv3 model - using custom transforms")
-            # DINOv3 transform
+        elif 'eva02' in dir_name.lower():
+            model_name = 'eva02_large_patch14_448.mim_m38m_ft_in22k_in1k'
+            print(f"Detected TIMM EVA02 model from directory name")
             transform = transforms.Compose([
-                transforms.Resize(256),
-                transforms.CenterCrop(256),
+                transforms.Resize((448, 448)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+    elif model_name:
+        # Check if it's a TIMM model from config
+        if 'eva02' in model_name.lower() and 'facebook' not in model_name.lower():
+            use_timm = True
+            print("Detected EVA02 model - using TIMM transforms")
+            transform = transforms.Compose([
+                transforms.Resize((448, 448)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+        elif 'dinov3' in model_name.lower() or 'vit_base_patch16_dinov3' in model_name.lower():
+            use_timm = True
+            print("Detected DINOv3 TIMM model - using custom transforms")
+            transform = transforms.Compose([
+                transforms.Resize((256, 256)),  # Direct resize to preserve full image
                 transforms.ToTensor(),
                 transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
             ])
@@ -149,7 +189,7 @@ def predict_test_set(
     if use_timm:
         if not TIMM_AVAILABLE:
             raise ImportError("timm is required for TIMM models. Install with: pip install timm")
-        # Try to load TIMM model
+        # Load TIMM model
         try:
             print(f"Loading TIMM model: {model_name}")
             model = timm.create_model(model_name, pretrained=False, num_classes=NUM_CLASSES)
@@ -176,33 +216,39 @@ def predict_test_set(
             print(f"Please ensure the path is correct and contains model files")
             raise e
         
-        # For DINOv3, we already have transform, don't need processor
-        if not use_hf_dinov3:
-            # Try to load processor from multiple locations
-            processor_paths = [
-                checkpoint_path,  # Try checkpoint directory first
-                checkpoint_path.parent,  # Try parent directory (main output dir)
-            ]
-            
-            if model_name:
-                processor_paths.append(model_name)
-            
-            for proc_path in processor_paths:
-                try:
-                    if isinstance(proc_path, str) and not os.path.exists(proc_path):
-                        # Try to load from HuggingFace hub
-                        processor = AutoImageProcessor.from_pretrained(proc_path, use_fast=True)
-                        print(f"Processor loaded from: {proc_path}")
-                        break
-                    elif isinstance(proc_path, Path) and proc_path.exists():
-                        processor = AutoImageProcessor.from_pretrained(str(proc_path), use_fast=True)
-                        print(f"Processor loaded from: {proc_path}")
-                        break
-                except Exception as e:
-                    continue
-            
-            if processor is None:
-                print("Warning: Cannot find processor, will use transforms if available")
+        # Try to load processor from multiple locations
+        processor_paths = [
+            checkpoint_path,  # Try checkpoint directory first
+            checkpoint_path.parent,  # Try parent directory (main output dir)
+        ]
+        
+        if model_name:
+            processor_paths.append(model_name)
+        
+        for proc_path in processor_paths:
+            try:
+                if isinstance(proc_path, str) and not os.path.exists(proc_path):
+                    # Try to load from HuggingFace hub
+                    processor = AutoImageProcessor.from_pretrained(proc_path, use_fast=True)
+                    print(f"Processor loaded from: {proc_path}")
+                    break
+                elif isinstance(proc_path, Path) and proc_path.exists():
+                    processor = AutoImageProcessor.from_pretrained(str(proc_path), use_fast=True)
+                    print(f"Processor loaded from: {proc_path}")
+                    break
+            except Exception as e:
+                continue
+        
+        if processor is None:
+            print("Warning: Cannot find processor, will use default transform")
+            # Create default transform for models without processor (e.g., DINOv2)
+            # Use 256x256 as default size (works for most vision models)
+            transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+            ])
+            print("Using default transform: Resize(256, 256) + Normalize")
     
     # Check label mapping
     label_map_paths = [
@@ -227,7 +273,7 @@ def predict_test_set(
         img_dir=test_img_dir,
         processor=processor,
         transform=transform,
-        use_timm=use_timm or use_hf_dinov3,
+        use_timm=use_timm,
     )
     
     print(f"Test set samples: {len(test_dataset)}")
@@ -236,9 +282,12 @@ def predict_test_set(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=PREDICT_NUM_WORKERS,
         pin_memory=True
     )
+    
+    if IS_WINDOWS:
+        print("Running on Windows: using num_workers=0 to avoid multiprocessing issues")
     
     model.to(device)
     model.eval()
@@ -324,6 +373,7 @@ def predict_test_set(
 
 
 def main():
+    model_name = 'dinov2'
     parser = argparse.ArgumentParser(description='Predict on test set using trained model')
     
     parser.add_argument('--checkpoint_path', type=str, required=True,
@@ -334,7 +384,7 @@ def main():
     parser.add_argument('--test_img_dir', type=str, default='test_images',
                         help='Test image directory')
     
-    parser.add_argument('--output_csv', type=str, default='test_data_predictions.csv',
+    parser.add_argument('--output_csv', type=str, default=f'{model_name}.csv',
                         help='Output CSV file path')
     
     parser.add_argument('--batch_size', type=int, default=16,
