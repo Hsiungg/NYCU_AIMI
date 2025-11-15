@@ -4,3 +4,4 @@
 output/
 *.txt
 wandb/
+kaggle.json
